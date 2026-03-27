@@ -1,5 +1,5 @@
 {
-  "name": "erc20-vesting-dashboard",
+  "name": "erc20-airdrop-dashboard",
   "version": "0.1.0",
   "private": true,
   "dependencies": {

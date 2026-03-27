@@ -1,29 +1,34 @@
 import { useState, useEffect } from 'react';
 import { ethers } from 'ethers';
 import './App.css';
-import TokenVestingABI from './contracts/TokenVesting.json';
+import TokenAirdropABI from './contracts/TokenAirdrop.json';
 import sepoliaDeployment from './contracts/sepolia.json';
+import proofs from './proofs.json';
 
-const VESTING_ADDRESS = sepoliaDeployment.TokenVesting.address;
-const ABI = TokenVestingABI.abi;
+const AIRDROP_ADDRESS = sepoliaDeployment.TokenAirdrop.address;
+const ABI = TokenAirdropABI.abi;
 
 const STATUS_COLORS = {
-  create:   { backgroundColor: '#3b82f6', color: '#fff' },
-  release:  { backgroundColor: '#84cc16', color: '#fff' },
-  revoke:   { backgroundColor: '#6b0f1a', color: '#fff' },
-  withdraw: { backgroundColor: '#84cc16', color: '#fff' },
+  claim:    { backgroundColor: '#84cc16', color: '#fff' },
+  recover:  { backgroundColor: '#6b0f1a', color: '#fff' },
+  update:   { backgroundColor: '#7c3aed', color: '#fff' },
+  pause:    { backgroundColor: '#f59e0b', color: '#fff' },
   success:  { backgroundColor: '#22c55e', color: '#fff' },
   error:    { backgroundColor: '#dc2626', color: '#fff' },
   default:  { backgroundColor: '#e0f2fe', color: '#0f4c5c' },
 };
 
 const parseError = (err) => {
-  if (err.message.includes('user rejected'))       return 'Transaction rejected in MetaMask.';
-  if (err.message.includes('insufficient funds'))  return 'Insufficient funds for this transaction.';
-  if (err.message.includes('Not enough tokens'))   return 'Not enough tokens in contract to create schedule.';
-  if (err.message.includes('Only beneficiary'))    return 'Only the beneficiary can release tokens.';
-  if (err.message.includes('No tokens available')) return 'No tokens available to release yet.';
-  if (err.message.includes('Already revoked'))     return 'This vesting schedule has already been revoked.';
+  if (err.message.includes('user rejected'))           return 'Transaction rejected in MetaMask.';
+  if (err.message.includes('insufficient funds'))      return 'Insufficient funds for this transaction.';
+  if (err.message.includes('Airdrop has ended'))       return 'The airdrop claim period has ended.';
+  if (err.message.includes('Already claimed'))         return 'This wallet has already claimed its airdrop.';
+  if (err.message.includes('Invalid merkle proof'))    return 'Invalid merkle proof. You may not be eligible.';
+  if (err.message.includes('Amount must be greater'))  return 'Amount must be greater than 0.';
+  if (err.message.includes('Airdrop has not ended'))   return 'Airdrop has not ended yet. Cannot recover tokens.';
+  if (err.message.includes('No tokens to recover'))    return 'No tokens to recover.';
+  if (err.message.includes('Merkle root cannot be zero')) return 'Merkle root cannot be zero.';
+  if (err.message.includes('Deadline must be in the future')) return 'Deadline must be in the future.';
   return 'Transaction failed. Please try again.';
 };
 
@@ -43,122 +48,52 @@ function Spinner() {
   );
 }
 
-function VestingProgressBar({ released, totalAmount }) {
-  const releasedNum = Number(ethers.utils.formatUnits(released, 18));
-  const totalNum    = Number(ethers.utils.formatUnits(totalAmount, 18));
-  const pct = totalNum > 0 ? Math.min(100, (releasedNum / totalNum) * 100) : 0;
-  return (
-    <div style={{ marginBottom: '12px' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-        <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Claimed Progress</p>
-        <p className="text-xs font-semibold" style={{ color: '#0f4c5c' }}>{pct.toFixed(1)}%</p>
-      </div>
-      <div style={{
-        height: '8px',
-        borderRadius: '9999px',
-        backgroundColor: 'rgba(15,76,92,0.12)',
-        overflow: 'hidden',
-      }}>
-        <div style={{
-          height: '100%',
-          width: `${pct}%`,
-          borderRadius: '9999px',
-          background: 'linear-gradient(90deg, #0f4c5c, #84cc16)',
-          transition: 'width 0.6s ease',
-        }} />
-      </div>
-    </div>
-  );
-}
-
 function App() {
-  const [contract,      setContract]      = useState(null);
-  const [readContract,  setReadContract]  = useState(null);
-  const [account,       setAccount]       = useState(null);
-  const [isAdmin,       setIsAdmin]       = useState(false);
-  const [withdrawable,  setWithdrawable]  = useState('');
-  const [totalLocked,   setTotalLocked]   = useState('');
-  const [scheduleCount, setScheduleCount] = useState(0);
-  const [mySchedules,   setMySchedules]   = useState([]);
-  const [status,        setStatus]        = useState('');
-  const [statusStyle,   setStatusStyle]   = useState(STATUS_COLORS.default);
-  const [isLoading,     setIsLoading]     = useState(false);
-  const [txHash,        setTxHash]        = useState('');
+  const [contract,        setContract]        = useState(null);
+  const [readContract,    setReadContract]    = useState(null);
+  const [account,         setAccount]         = useState(null);
+  const [isAdmin,         setIsAdmin]         = useState(false);
+  const [isPauser,        setIsPauser]        = useState(false);
+  const [isPaused,        setIsPaused]        = useState(false);
+  const [contractBalance, setContractBalance] = useState('');
+  const [totalClaimed,    setTotalClaimed]    = useState('');
+  const [claimDeadline,   setClaimDeadline]   = useState('');
+  const [hasClaimed,      setHasClaimed]      = useState(false);
+  const [eligible,        setEligible]        = useState(null);
+  const [status,          setStatus]          = useState('');
+  const [statusStyle,     setStatusStyle]     = useState(STATUS_COLORS.default);
+  const [isLoading,       setIsLoading]       = useState(false);
+  const [txHash,          setTxHash]          = useState('');
 
-  // Create schedule form
-  const [createBeneficiary, setCreateBeneficiary] = useState('');
-  const [createAmount,      setCreateAmount]      = useState('');
-  const [createStart,       setCreateStart]       = useState('');
-  const [createCliff,       setCreateCliff]       = useState('');
-  const [createDuration,    setCreateDuration]    = useState('');
+  // Admin state
+  const [newMerkleRoot, setNewMerkleRoot] = useState('');
+  const [newDeadline,   setNewDeadline]   = useState('');
 
-  // Admin withdraw
-  const [withdrawAmount, setWithdrawAmount] = useState('');
+  // Countdown timer
+  const [countdown, setCountdown] = useState('');
 
-  // Admin lookup
-  const [lookupAddress, setLookupAddress]     = useState('');
-  const [lookupSchedules, setLookupSchedules] = useState([]);
-  const [lookupLoading, setLookupLoading]     = useState(false);
-  const [lookupError, setLookupError]         = useState('');
-
-  const handleLookup = async () => {
-    if (!lookupAddress) {
-      setLookupError('Please enter a wallet address.');
-      return;
-    }
-    try {
-      setLookupLoading(true);
-      setLookupError('');
-      setLookupSchedules([]);
-      const holderCount = await readContract.holdersVestingCount(lookupAddress);
-      const schedules = [];
-      for (let i = 0; i < holderCount.toNumber(); i++) {
-        const vestingId  = await readContract.getVestingIdAtIndex(lookupAddress, i);
-        const schedule   = await readContract.getVestingSchedule(vestingId);
-        const releasable = await readContract.computeReleasableAmount(schedule);
-        // If revoked, get the exact releasable at the block revocation happened
-        let revokedReleasable = null;
-        if (schedule.revoked) {
-          try {
-            // Find the revoke tx block by scanning recent blocks for VestingRevoked topic
-            const revokeFilter = {
-              address: VESTING_ADDRESS,
-              topics: [ethers.utils.id('VestingRevoked(bytes32,address,uint256)')],
-              fromBlock: -10000, // last 10000 blocks
-              toBlock: 'latest',
-            };
-            const provider = readContract.provider;
-            const logs = await provider.getLogs(revokeFilter);
-            const iface = new ethers.utils.Interface([
-              'event VestingRevoked(bytes32 vestingId, address beneficiary, uint256 returnedAmount)'
-            ]);
-            const matchingLog = logs
-              .map(log => { try { return { ...iface.parseLog(log), blockNumber: log.blockNumber }; } catch { return null; } })
-              .filter(Boolean)
-              .find(e => e.args.vestingId === vestingId);
-
-            if (matchingLog) {
-              const blockTag = matchingLog.blockNumber - 1;
-              const contractAtBlock = readContract.attach(readContract.address);
-              const releasableAtRevoke = await contractAtBlock.computeReleasableAmount(schedule, { blockTag });
-              revokedReleasable = releasableAtRevoke;
-            }
-          } catch (e) {
-            revokedReleasable = schedule.totalAmount.sub(schedule.released);
-          }
-        }
-
-        schedules.push({ vestingId, schedule, releasable, revokedReleasable });
+  useEffect(() => {
+    if (!claimDeadline || claimDeadline === '0') return;
+    const tick = () => {
+      const diff = Number(claimDeadline) - Math.floor(Date.now() / 1000);
+      if (diff <= 0) {
+        setCountdown('Claim period has ended');
+        return;
       }
-      if (schedules.length === 0) {
-        setLookupError('No vesting schedules found for this address.');
-      }
-      setLookupSchedules(schedules);
-      setLookupLoading(false);
-    } catch (err) {
-      setLookupLoading(false);
-      setLookupError('Error loading schedules: ' + err.message);
-    }
+      const days    = Math.floor(diff / 86400);
+      const hours   = Math.floor((diff % 86400) / 3600);
+      const minutes = Math.floor((diff % 3600) / 60);
+      const seconds = diff % 60;
+      setCountdown(`${days}d ${hours}h ${minutes}m ${seconds}s`);
+    };
+    tick();
+    const interval = setInterval(tick, 1000);
+    return () => clearInterval(interval);
+  }, [claimDeadline]);
+
+  const getProofForAccount = (address) => {
+    if (!address) return null;
+    return proofs[address.toLowerCase()] || null;
   };
 
   const connectWallet = async () => {
@@ -173,9 +108,6 @@ function App() {
       
       if (chainId !== '0xaa36a7') {
         setStatus('Please switch MetaMask to the Sepolia network.');
-        setStatusStyle(STATUS_COLORS.error);
-        return;
-      }
 
       await window.ethereum.request({ method: 'eth_requestAccounts' });
 
@@ -183,13 +115,14 @@ function App() {
       const _signer  = metaMaskProvider.getSigner();
       const _account = await _signer.getAddress();
 
-      const alchemyProvider = new ethers.providers.JsonRpcProvider(
+      
+      const provider = new ethers.providers.JsonRpcProvider(
         process.env.REACT_APP_ALCHEMY_URL,
         { name: 'sepolia', chainId: 11155111 }
       );
 
-      const _contract     = new ethers.Contract(VESTING_ADDRESS, ABI, _signer);
-      const _readContract = new ethers.Contract(VESTING_ADDRESS, ABI, alchemyProvider);
+      const _contract     = new ethers.Contract(AIRDROP_ADDRESS, ABI, _signer);
+      const _readContract = new ethers.Contract(AIRDROP_ADDRESS, ABI, provider);
 
       setContract(_contract);
       setReadContract(_readContract);
@@ -205,14 +138,14 @@ function App() {
   useEffect(() => {
     if (!window.ethereum) return;
     const handleAccountChange = async (accounts) => {
-      // Always clear status and txHash when switching accounts
       setStatus('');
       setTxHash('');
       if (accounts.length === 0) {
         setAccount(null);
         setContract(null);
         setReadContract(null);
-        setMySchedules([]);
+        setEligible(null);
+        setHasClaimed(false);
       } else {
         await connectWallet();
       }
@@ -225,59 +158,27 @@ function App() {
   const loadDashboardData = async (_contract, _account) => {
     try {
       const ADMIN_ROLE  = await _contract.ADMIN_ROLE();
+      const PAUSER_ROLE = await _contract.PAUSER_ROLE();
       const adminCheck  = await _contract.hasRole(ADMIN_ROLE, _account);
+      const pauserCheck = await _contract.hasRole(PAUSER_ROLE, _account);
+      const paused      = await _contract.paused();
+
       setIsAdmin(adminCheck);
+      setIsPauser(pauserCheck);
+      setIsPaused(paused);
 
-      const withdrawableAmt = await _contract.getWithdrawableAmount();
-      const totalLockedAmt  = await _contract.vestingSchedulesTotalAmount();
-      const activeCount = await _contract.activeSchedulesCount();
+      const balance  = await _contract.getContractBalance();
+      const claimed  = await _contract.totalClaimed();
+      const deadline = await _contract.claimDeadline();
+      const claimed_ = await _contract.hasAddressClaimed(_account);
 
-      setWithdrawable(ethers.utils.formatUnits(withdrawableAmt, 18));
-      setTotalLocked(ethers.utils.formatUnits(totalLockedAmt, 18));
-      setScheduleCount(activeCount.toString());
+      setContractBalance(ethers.utils.formatUnits(balance, 18));
+      setTotalClaimed(ethers.utils.formatUnits(claimed, 18));
+      setClaimDeadline(deadline.toString());
+      setHasClaimed(claimed_);
 
-      const holderCount = await _contract.holdersVestingCount(_account);
-      const schedules   = [];
-      for (let i = 0; i < holderCount.toNumber(); i++) {
-        const vestingId  = await _contract.getVestingIdAtIndex(_account, i);
-        const schedule   = await _contract.getVestingSchedule(vestingId);
-        const releasable = await _contract.computeReleasableAmount(schedule);
-
-        // If revoked, get the exact releasable at the block revocation happened
-        let revokedReleasable = null;
-        if (schedule.revoked) {
-          try {
-            // Find the revoke tx block by scanning recent blocks for VestingRevoked topic
-            const revokeFilter = {
-              address: VESTING_ADDRESS,
-              topics: [ethers.utils.id('VestingRevoked(bytes32,address,uint256)')],
-              fromBlock: -10000, // last 10000 blocks
-              toBlock: 'latest',
-            };
-            const provider = _contract.provider;
-            const logs = await provider.getLogs(revokeFilter);
-            const iface = new ethers.utils.Interface([
-              'event VestingRevoked(bytes32 vestingId, address beneficiary, uint256 returnedAmount)'
-            ]);
-            const matchingLog = logs
-              .map(log => { try { return { ...iface.parseLog(log), blockNumber: log.blockNumber }; } catch { return null; } })
-              .filter(Boolean)
-              .find(e => e.args.vestingId === vestingId);
-
-            if (matchingLog) {
-              const blockTag = matchingLog.blockNumber - 1;
-              const contractAtBlock = _contract.attach(_contract.address);
-              const releasableAtRevoke = await contractAtBlock.computeReleasableAmount(schedule, { blockTag });
-              revokedReleasable = releasableAtRevoke;
-            }
-          } catch (e) {
-            revokedReleasable = schedule.totalAmount.sub(schedule.released);
-          }
-        }
-
-        schedules.push({ vestingId, schedule, releasable, revokedReleasable });
-      }
-      setMySchedules(schedules);
+      const entry = getProofForAccount(_account);
+      setEligible(entry);
     } catch (err) {
       setStatus('Error loading data: ' + err.message);
       setStatusStyle(STATUS_COLORS.error);
@@ -292,44 +193,82 @@ function App() {
     setStatus('');
   };
 
-  const handleCreateSchedule = async () => {
-    if (!createBeneficiary || !createAmount || !createStart || !createCliff || !createDuration) {
-      setStatus('Please fill in all fields.');
+  const handleClaim = async () => {
+    if (!eligible) {
+      setStatus('Your wallet is not eligible for this airdrop.');
       setStatusStyle(STATUS_COLORS.error);
       return;
     }
     try {
-      setStatus('Creating vesting schedule...');
-      setStatusStyle(STATUS_COLORS.create);
+      setStatus('Claiming airdrop tokens...');
+      setStatusStyle(STATUS_COLORS.claim);
       setIsLoading(true);
+      const amount = ethers.utils.parseUnits(eligible.amount, 18);
+      const proof  = eligible.proof;
+      const tx = await contract.claim(amount, proof);
+      await tx.wait();
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      setIsLoading(false);
+      setTxHash(tx.hash);
+      setStatus('Airdrop claimed successfully!');
+      setStatusStyle(STATUS_COLORS.success);
+      await loadDashboardData(readContract, account);
+    } catch (err) {
+      setIsLoading(false);
+      setTxHash('');
+      setStatus(parseError(err));
+      setStatusStyle(STATUS_COLORS.error);
+    }
+  };
 
-      // ABI expects uint64 — pass as plain numbers
-      // Parse date as local time (not UTC) to avoid timezone shift
-      const [year, month, day] = createStart.split('-').map(Number);
+  const handleUpdateMerkleRoot = async () => {
+    if (!newMerkleRoot || !newMerkleRoot.startsWith('0x')) {
+      setStatus('Please enter a valid Merkle root.');
+      setStatusStyle(STATUS_COLORS.error);
+      return;
+    }
+    try {
+      setStatus('Updating Merkle root...');
+      setStatusStyle(STATUS_COLORS.update);
+      setIsLoading(true);
+      const tx = await contract.updateMerkleRoot(newMerkleRoot);
+      await tx.wait();
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      setIsLoading(false);
+      setTxHash(tx.hash);
+      setStatus('Merkle root updated!');
+      setStatusStyle(STATUS_COLORS.success);
+      setNewMerkleRoot('');
+    } catch (err) {
+      setIsLoading(false);
+      setTxHash('');
+      setStatus(parseError(err));
+      setStatusStyle(STATUS_COLORS.error);
+    }
+  };
+
+  const handleUpdateDeadline = async () => {
+    if (!newDeadline) {
+      setStatus('Please select a new deadline date.');
+      setStatusStyle(STATUS_COLORS.error);
+      return;
+    }
+    try {
+      setStatus('Updating claim deadline...');
+      setStatusStyle(STATUS_COLORS.update);
+      setIsLoading(true);
+      const [year, month, day] = newDeadline.split('-').map(Number);
       const localDate = new Date(year, month - 1, day);
-      const startTimestamp = Math.floor(localDate.getTime() / 1000);
-      const cliffSeconds    = Number(createCliff)    * 86400;
-      const durationSeconds = Number(createDuration) * 86400;
-
-      const tx = await contract.createVestingSchedule(
-        createBeneficiary,
-        ethers.utils.parseUnits(createAmount, 18),
-        startTimestamp,
-        cliffSeconds,
-        durationSeconds
-      );
+      const timestamp = Math.floor(localDate.getTime() / 1000);
+      const tx = await contract.updateDeadline(timestamp);
       await tx.wait();
       await new Promise(resolve => setTimeout(resolve, 2000));
       setIsLoading(false);
       setTxHash(tx.hash);
-      setStatus('Vesting schedule created!');
+      setStatus('Claim deadline updated!');
       setStatusStyle(STATUS_COLORS.success);
       await loadDashboardData(readContract, account);
-      setCreateBeneficiary('');
-      setCreateAmount('');
-      setCreateStart('');
-      setCreateCliff('');
-      setCreateDuration('');
+      setNewDeadline('');
     } catch (err) {
       setIsLoading(false);
       setTxHash('');
@@ -338,17 +277,17 @@ function App() {
     }
   };
 
-  const handleRelease = async (vestingId) => {
+  const handlePause = async () => {
     try {
-      setStatus('Releasing tokens...');
-      setStatusStyle(STATUS_COLORS.release);
+      setStatus(isPaused ? 'Unpausing airdrop...' : 'Pausing airdrop...');
+      setStatusStyle(STATUS_COLORS.pause);
       setIsLoading(true);
-      const tx = await contract.release(vestingId);
+      const tx = isPaused ? await contract.unpause() : await contract.pause();
       await tx.wait();
       await new Promise(resolve => setTimeout(resolve, 2000));
       setIsLoading(false);
       setTxHash(tx.hash);
-      setStatus('Tokens released successfully!');
+      setStatus(isPaused ? 'Airdrop unpaused!' : 'Airdrop paused!');
       setStatusStyle(STATUS_COLORS.success);
       await loadDashboardData(readContract, account);
     } catch (err) {
@@ -359,17 +298,17 @@ function App() {
     }
   };
 
-  const handleRevoke = async (vestingId) => {
+  const handleRecover = async () => {
     try {
-      setStatus('Revoking vesting schedule...');
-      setStatusStyle(STATUS_COLORS.revoke);
+      setStatus('Recovering unclaimed tokens...');
+      setStatusStyle(STATUS_COLORS.recover);
       setIsLoading(true);
-      const tx = await contract.revoke(vestingId);
+      const tx = await contract.recoverTokens();
       await tx.wait();
       await new Promise(resolve => setTimeout(resolve, 2000));
       setIsLoading(false);
       setTxHash(tx.hash);
-      setStatus('Vesting schedule revoked!');
+      setStatus('Tokens recovered successfully!');
       setStatusStyle(STATUS_COLORS.success);
       await loadDashboardData(readContract, account);
     } catch (err) {
@@ -379,52 +318,20 @@ function App() {
       setStatusStyle(STATUS_COLORS.error);
     }
   };
-
-  const handleWithdraw = async () => {
-    if (!withdrawAmount || Number(withdrawAmount) <= 0) {
-      setStatus('Please enter a valid amount.');
-      setStatusStyle(STATUS_COLORS.error);
-      return;
-    }
-    try {
-      setStatus('Withdrawing tokens...');
-      setStatusStyle(STATUS_COLORS.withdraw);
-      setIsLoading(true);
-      // If withdrawing the max amount, use exact contract value to avoid rounding issues
-      const withdrawableExact = await readContract.getWithdrawableAmount();
-      const withdrawAmountParsed = ethers.utils.parseUnits(withdrawAmount, 18);
-      const finalAmount = withdrawAmountParsed.gte(withdrawableExact) ? withdrawableExact : withdrawAmountParsed;
-      const tx = await contract.withdraw(finalAmount);
-      await tx.wait();
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      setIsLoading(false);
-      setTxHash(tx.hash);
-      setStatus('Withdrawal successful!');
-      setStatusStyle(STATUS_COLORS.success);
-      await loadDashboardData(readContract, account);
-      setWithdrawAmount('');
-    } catch (err) {
-      setIsLoading(false);
-      setTxHash('');
-      setStatus(parseError(err));
-      setStatusStyle(STATUS_COLORS.error);
-    }
-  };
-
-  const formatDate = (timestamp) =>
-    new Date(Number(timestamp) * 1000).toLocaleDateString();
 
   const formatTokens = (amount) =>
-    Number(ethers.utils.formatUnits(amount, 18)).toLocaleString();
+    Number(amount).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 
-  const getEndDate = (schedule) => {
-    try {
-      const start    = ethers.BigNumber.from(schedule.start);
-      const duration = ethers.BigNumber.from(schedule.duration);
-      return formatDate(start.add(duration));
-    } catch {
-      return 'N/A';
-    }
+  const formatDeadline = (timestamp) => {
+    if (!timestamp || timestamp === '0') return 'N/A';
+    return new Date(Number(timestamp) * 1000).toLocaleDateString('en-US', {
+      year: 'numeric', month: 'long', day: 'numeric'
+    });
+  };
+
+  const deadlinePassed = () => {
+    if (!claimDeadline || claimDeadline === '0') return false;
+    return Date.now() / 1000 > Number(claimDeadline);
   };
 
   return (
@@ -438,10 +345,10 @@ function App() {
           <div className="flex justify-between items-center mb-6">
             <div>
               <h1 className="text-5xl font-bold tracking-tight" style={{ color: '#0f4c5c' }}>
-                Token <span style={{ color: '#84cc16' }}>Vesting</span> Dashboard
+                Token <span style={{ color: '#7c3aed' }}>Airdrop</span> Dashboard
               </h1>
               <p className="text-sm mt-2 uppercase tracking-widest font-medium" style={{ color: '#64748b' }}>
-                Investor Vesting Management Interface
+                Merkle Airdrop Distribution Interface
               </p>
             </div>
             {account && (
@@ -487,14 +394,14 @@ function App() {
 
           {!account ? (
             <div className="text-center py-32">
-              <div className="mb-6 text-6xl">🔗</div>
+              <div className="mb-6 text-6xl">🪂</div>
               <button onClick={connectWallet}
-                className="px-8 py-4 rounded-xl font-semibold text-white text-lg transition-all hover:opacity-90 mb-6"
+                className="px-8 py-4 rounded-xl font-semibold text-white text-lg transition-all hover:opacity-90 mb-6 btn-hover"
                 style={{ backgroundColor: '#84cc16' }}>
                 Connect Wallet
               </button>
               <p className="text-3xl font-bold mb-3 tracking-tight" style={{ color: '#0f4c5c' }}>
-                Connect your wallet to get started
+                Connect your wallet to check eligibility
               </p>
               <p className="text-sm uppercase tracking-widest" style={{ color: '#64748b' }}>
                 Make sure you're on the Sepolia test network
@@ -503,127 +410,127 @@ function App() {
           ) : (
             <>
               {/* STATS */}
-              {(isAdmin || mySchedules.some(s => !s.releasable.eq(0))) && (
-              <div className={`grid gap-3 mb-8 ${isAdmin ? 'grid-cols-3' : 'grid-cols-2'}`}>
-                {[
-                  { label: 'Total Locked',    value: Number(totalLocked).toLocaleString() + ' tokens' },
-                  ...(isAdmin ? [{ label: 'Withdrawable', value: Number(withdrawable).toLocaleString() + ' tokens' }] : []),
-                  { label: 'Active Schedules', value: scheduleCount },
-                ].map((stat) => (
-                  <div key={stat.label} className="rounded-2xl p-4 shadow-sm card-hover"
-                    style={{
-                      backgroundColor: 'rgba(255,255,255,0.6)',
-                      backdropFilter: 'blur(12px)',
-                      WebkitBackdropFilter: 'blur(12px)',
-                      border: '1px solid rgba(255,255,255,0.8)',
-                      borderLeft: '4px solid #0f4c5c',
-                    }}>
-                    <p className="text-xs uppercase tracking-wide mb-1" style={{ color: '#64748b' }}>{stat.label}</p>
-                    <p className="text-lg font-bold" style={{ color: '#84cc16' }}>{stat.value}</p>
-                  </div>
-                ))}
+              <div className="grid grid-cols-3 gap-3 mb-8">
+                <div className="rounded-2xl p-4 shadow-sm card-hover"
+                  style={{
+                    backgroundColor: 'rgba(255,255,255,0.6)',
+                    backdropFilter: 'blur(12px)',
+                    WebkitBackdropFilter: 'blur(12px)',
+                    border: '1px solid rgba(255,255,255,0.8)',
+                    borderLeft: '4px solid #0f4c5c',
+                  }}>
+                  <p className="text-xs uppercase tracking-wide mb-1" style={{ color: '#64748b' }}>Contract Balance</p>
+                  <p className="text-lg font-bold" style={{ color: '#7c3aed' }}>{formatTokens(contractBalance)} tokens</p>
+                </div>
+                <div className="rounded-2xl p-4 shadow-sm card-hover"
+                  style={{
+                    backgroundColor: 'rgba(255,255,255,0.6)',
+                    backdropFilter: 'blur(12px)',
+                    WebkitBackdropFilter: 'blur(12px)',
+                    border: '1px solid rgba(255,255,255,0.8)',
+                    borderLeft: '4px solid #0f4c5c',
+                  }}>
+                  <p className="text-xs uppercase tracking-wide mb-1" style={{ color: '#64748b' }}>Total Claimed</p>
+                  <p className="text-lg font-bold" style={{ color: '#7c3aed' }}>{formatTokens(totalClaimed)} tokens</p>
+                </div>
+                <div className="rounded-2xl p-4 shadow-sm card-hover"
+                  style={{
+                    backgroundColor: 'rgba(255,255,255,0.6)',
+                    backdropFilter: 'blur(12px)',
+                    WebkitBackdropFilter: 'blur(12px)',
+                    border: '1px solid rgba(255,255,255,0.8)',
+                    borderLeft: deadlinePassed() ? '4px solid #dc2626' : '4px solid #0f4c5c',
+                  }}>
+                  <p className="text-xs uppercase tracking-wide mb-1" style={{ color: '#64748b' }}>Claim Deadline</p>
+                  <p className="text-sm font-bold" style={{ color: deadlinePassed() ? '#dc2626' : '#7c3aed' }}>
+                    {countdown || 'Loading...'}
+                  </p>
+                </div>
               </div>
-              )}
 
-              {/* MY VESTING SCHEDULES */}
-              {(isAdmin || mySchedules.length > 0) && (
+              {/* MY AIRDROP STATUS */}
               <div className="rounded-2xl p-6 mb-8 shadow-sm card-hover"
                 style={{
                   backgroundColor: 'rgba(255,255,255,0.6)',
                   backdropFilter: 'blur(12px)',
                   WebkitBackdropFilter: 'blur(12px)',
                   border: '1px solid rgba(255,255,255,0.8)',
-                  borderLeft: '4px solid #84cc16',
+                  borderLeft: '4px solid #7c3aed',
                 }}>
-                <h2 className="text-lg font-bold mb-4" style={{ color: '#0f4c5c' }}>My Vesting Schedules</h2>
+                <h2 className="text-lg font-bold mb-4" style={{ color: '#0f4c5c' }}>My Airdrop Status</h2>
 
-                {mySchedules.length === 0 ? (
-                  <p className="text-sm" style={{ color: '#64748b' }}>No vesting schedules found for your wallet.</p>
+                {!eligible ? (
+                  <div className="rounded-xl p-4"
+                    style={{
+                      backgroundColor: 'rgba(255,255,255,0.5)',
+                      border: '1px solid rgba(255,255,255,0.8)',
+                      borderLeft: '4px solid #dc2626',
+                    }}>
+                    <p className="text-sm font-semibold" style={{ color: '#dc2626' }}>❌ Not Eligible</p>
+                    <p className="text-sm mt-1" style={{ color: '#64748b' }}>
+                      This wallet address is not on the airdrop whitelist.
+                    </p>
+                  </div>
+                ) : hasClaimed ? (
+                  <div className="rounded-xl p-4"
+                    style={{
+                      backgroundColor: 'rgba(255,255,255,0.5)',
+                      border: '1px solid rgba(255,255,255,0.8)',
+                      borderLeft: '4px solid #7c3aed',
+                    }}>
+                    <p className="text-sm font-semibold" style={{ color: '#7c3aed' }}>✓ Airdrop Claimed</p>
+                    <p className="text-sm mt-1" style={{ color: '#64748b' }}>
+                      You have successfully claimed your <strong>{eligible.amount} STK</strong> tokens.
+                    </p>
+                  </div>
+                ) : deadlinePassed() ? (
+                  <div className="rounded-xl p-4"
+                    style={{
+                      backgroundColor: 'rgba(255,255,255,0.5)',
+                      border: '1px solid rgba(255,255,255,0.8)',
+                      borderLeft: '4px solid #dc2626',
+                    }}>
+                    <p className="text-sm font-semibold" style={{ color: '#dc2626' }}>⚠️ Claim Period Ended</p>
+                    <p className="text-sm mt-1" style={{ color: '#64748b' }}>
+                      You were eligible for <strong>{eligible.amount} STK</strong> tokens but the claim deadline has passed.
+                    </p>
+                  </div>
                 ) : (
-                  mySchedules.map(({ vestingId, schedule, releasable, revokedReleasable }, idx) => (
-                    <div key={idx} className="rounded-xl p-4 mb-4"
+                  <div className="rounded-xl p-4"
+                    style={{
+                      backgroundColor: 'rgba(255,255,255,0.5)',
+                      border: '1px solid rgba(255,255,255,0.8)',
+                      borderLeft: '4px solid #84cc16',
+                    }}>
+                    <p className="text-sm font-semibold mb-1" style={{ color: '#22c55e' }}>✓ Eligible</p>
+                    <p className="text-sm mb-1" style={{ color: '#64748b' }}>
+                      Your wallet is eligible to claim <strong style={{ color: '#0f4c5c' }}>{eligible.amount} STK</strong> tokens.
+                    </p>
+                    <p className="text-xs mb-3" style={{ color: '#64748b' }}>
+                      Time remaining: <strong style={{ color: deadlinePassed() ? '#dc2626' : '#0f4c5c' }}>{countdown}</strong>
+                    </p>
+                    <button
+                      onClick={handleClaim}
+                      disabled={isLoading || isPaused}
+                      className="px-6 py-3 rounded-xl font-semibold text-white transition-all hover:opacity-90 btn-hover"
                       style={{
-                        backgroundColor: 'rgba(255,255,255,0.5)',
-                        border: '1px solid rgba(255,255,255,0.8)',
-                        borderLeft: schedule.revoked ? '4px solid #dc2626' : '4px solid #3b82f6',
+                        backgroundColor: '#7c3aed',
+                        opacity: (isLoading || isPaused) ? 0.5 : 1,
+                        cursor:  (isLoading || isPaused) ? 'not-allowed' : 'pointer',
                       }}>
-
-                      {!schedule.revoked && <VestingProgressBar released={schedule.released} totalAmount={schedule.totalAmount} />}
-
-                      <div className="grid grid-cols-4 gap-3 mb-3">
-                        <div>
-                          <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Total Amount</p>
-                          <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{formatTokens(schedule.totalAmount)}</p>
-                        </div>
-                        <div>
-                          <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Released</p>
-                          <p className="text-sm font-bold" style={{ color: '#1a5c38' }}>{formatTokens(schedule.released)}</p>
-                        </div>
-                        <div>
-                            <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Releasable Now</p>
-                            <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{formatTokens(releasable)}</p>
-                          </div>
-                        <div>
-                          <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Status</p>
-                          <p className="text-sm font-bold" style={{
-                            color: schedule.revoked ? '#dc2626' :
-                              releasable.add(schedule.released).gte(schedule.totalAmount) ? '#3b82f6' : '#22c55e'
-                          }}>
-                            {schedule.revoked ? 'Revoked' :
-                              releasable.add(schedule.released).gte(schedule.totalAmount) ? 'Vesting Complete' : 'Active'}
-                          </p>
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-3 gap-3 mb-3">
-                        <div>
-                          <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Start Date</p>
-                          <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{formatDate(schedule.start)}</p>
-                        </div>
-                        <div>
-                          <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Cliff Date</p>
-                          <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{formatDate(schedule.cliff)}</p>
-                        </div>
-                        <div>
-                          <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>End Date</p>
-                          <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{getEndDate(schedule)}</p>
-                        </div>
-                      </div>
-
-                      <div className="flex gap-3 mt-2">
-                        <button
-                          onClick={() => handleRelease(vestingId)}
-                          disabled={isLoading || releasable.eq(0)}
-                          className="px-5 py-2 rounded-xl font-semibold text-white text-sm transition-all hover:opacity-90 btn-hover"
-                          style={{
-                            backgroundColor: '#84cc16',
-                            opacity: (isLoading || releasable.eq(0)) ? 0.5 : 1,
-                            cursor:  (isLoading || releasable.eq(0)) ? 'not-allowed' : 'pointer',
-                          }}>
-                          Release Tokens
-                        </button>
-                        {isAdmin && !schedule.revoked && (
-                          <button
-                            onClick={() => handleRevoke(vestingId)}
-                            disabled={isLoading}
-                            className="px-5 py-2 rounded-xl font-semibold text-white text-sm transition-all hover:opacity-90 btn-hover"
-                            style={{
-                              backgroundColor: '#6b0f1a',
-                              opacity: isLoading ? 0.5 : 1,
-                              cursor:  isLoading ? 'not-allowed' : 'pointer',
-                            }}>
-                            Revoke
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  ))
+                      Claim {eligible.amount} STK
+                    </button>
+                    {isPaused && (
+                      <p className="text-xs mt-2" style={{ color: '#f59e0b' }}>
+                        ⚠️ Airdrop is currently paused. Claims are temporarily disabled.
+                      </p>
+                    )}
+                  </div>
                 )}
               </div>
-              )}
 
               {/* ADMIN PANEL */}
-              {isAdmin && (
+              {(isAdmin || isPauser) && (
                 <div className="rounded-2xl p-6 shadow-sm card-hover"
                   style={{
                     backgroundColor: 'rgba(255,255,255,0.6)',
@@ -634,163 +541,98 @@ function App() {
                   }}>
                   <h2 className="text-xl font-bold mb-6" style={{ color: '#0f4c5c' }}>Admin Panel</h2>
 
-                  {/* CREATE SCHEDULE */}
-                  <p className="text-sm font-semibold mb-3" style={{ color: '#1a5c38' }}>Create Vesting Schedule</p>
-                  <div className="grid grid-cols-2 gap-3 mb-3">
-                    <input type="text" placeholder="Beneficiary address (0x...)"
-                      value={createBeneficiary} onChange={(e) => setCreateBeneficiary(e.target.value)}
-                      className="border rounded-xl px-4 py-3 text-sm outline-none col-span-2"
-                      style={{ borderColor: '#bae6fd', color: '#334155' }} />
-                    <input type="number" placeholder="Amount of tokens"
-                      value={createAmount} onChange={(e) => setCreateAmount(e.target.value)}
-                      className="border rounded-xl px-4 py-3 text-sm outline-none"
-                      style={{ borderColor: '#bae6fd', color: '#334155' }} />
-                    <div className="border rounded-xl px-4 py-3 text-sm flex items-center justify-between"
-                      style={{ borderColor: '#bae6fd', backgroundColor: '#fff' }}>
-                      <span style={{ color: '#94a3b8', userSelect: 'none' }}>Start Date</span>
-                      <input type="date"
-                        value={createStart} onChange={(e) => setCreateStart(e.target.value)}
-                        className="outline-none text-sm"
-                        style={{ color: '#334155', border: 'none', background: 'transparent', cursor: 'pointer' }} />
-                    </div>
-                    <input type="number" placeholder="Cliff period (days)"
-                      value={createCliff} onChange={(e) => setCreateCliff(e.target.value)}
-                      className="border rounded-xl px-4 py-3 text-sm outline-none"
-                      style={{ borderColor: '#bae6fd', color: '#334155' }} />
-                    <input type="number" placeholder="Vesting duration (days)"
-                      value={createDuration} onChange={(e) => setCreateDuration(e.target.value)}
-                      className="border rounded-xl px-4 py-3 text-sm outline-none"
-                      style={{ borderColor: '#bae6fd', color: '#334155' }} />
-                  </div>
-                  <button onClick={handleCreateSchedule} disabled={isLoading}
-                    className="px-6 py-3 rounded-xl font-semibold text-white transition-all hover:opacity-90 btn-hover mb-8"
-                    style={{
-                      background: 'linear-gradient(135deg, #3b82f6, #2563eb)',
-                      opacity: isLoading ? 0.6 : 1,
-                      cursor:  isLoading ? 'not-allowed' : 'pointer',
-                    }}>
-                    Create Schedule
-                  </button>
-
-                  {/* LOOKUP & REVOKE */}
-                  <hr style={{ borderColor: 'rgba(15,76,92,0.1)', margin: '24px 0' }} />
-                  <p className="text-sm font-semibold mb-3" style={{ color: '#6b0f1a' }}>Lookup & Revoke Schedule</p>
-                  <div className="flex gap-3 mb-3">
-                    <input type="text" placeholder="Beneficiary address (0x...)"
-                      value={lookupAddress} onChange={(e) => setLookupAddress(e.target.value)}
-                      className="flex-1 border rounded-xl px-4 py-3 text-sm outline-none"
-                      style={{ borderColor: '#bae6fd', color: '#334155' }} />
-                    <button onClick={handleLookup} disabled={lookupLoading || isLoading}
-                      className="px-6 py-3 rounded-xl font-semibold text-white transition-all hover:opacity-90 btn-hover"
-                      style={{
-                        backgroundColor: '#3b82f6',
-                        opacity: (lookupLoading || isLoading) ? 0.6 : 1,
-                        cursor:  (lookupLoading || isLoading) ? 'not-allowed' : 'pointer',
-                      }}>
-                      {lookupLoading ? 'Loading...' : 'Look Up'}
-                    </button>
-                  </div>
-                  {lookupError && (
-                    <p className="text-sm mb-3" style={{ color: '#dc2626' }}>{lookupError}</p>
-                  )}
-                  {lookupSchedules.length > 0 && (
-                    <div className="mb-6">
-                      {lookupSchedules.map(({ vestingId, schedule, releasable }, idx) => (
-                        <div key={idx} className="rounded-xl p-4 mb-3"
+                  {isAdmin && (
+                    <>
+                      {/* UPDATE MERKLE ROOT */}
+                      <p className="text-sm font-semibold mb-2" style={{ color: '#7c3aed' }}>Update Merkle Root</p>
+                      <p className="text-xs mb-3" style={{ color: '#64748b' }}>
+                        Run generate-merkle.js with your updated whitelist to get a new root.
+                      </p>
+                      <div className="flex gap-3 mb-8">
+                        <input type="text" placeholder="New Merkle root (0x...)"
+                          value={newMerkleRoot} onChange={(e) => setNewMerkleRoot(e.target.value)}
+                          className="flex-1 border rounded-xl px-4 py-3 text-sm outline-none"
+                          style={{ borderColor: '#bae6fd', color: '#334155' }} />
+                        <button onClick={handleUpdateMerkleRoot} disabled={isLoading}
+                          className="px-6 py-3 rounded-xl font-semibold text-white transition-all hover:opacity-90 btn-hover"
                           style={{
-                            backgroundColor: 'rgba(255,255,255,0.5)',
-                            border: '1px solid rgba(255,255,255,0.8)',
-                            borderLeft: schedule.revoked ? '4px solid #dc2626' : '4px solid #3b82f6',
+                            backgroundColor: '#7c3aed',
+                            opacity: isLoading ? 0.6 : 1,
+                            cursor:  isLoading ? 'not-allowed' : 'pointer',
                           }}>
-                          <div className="grid grid-cols-4 gap-3 mb-3">
-                            <div>
-                              <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Total Amount</p>
-                              <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{formatTokens(schedule.totalAmount)}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Released</p>
-                              <p className="text-sm font-bold" style={{ color: '#1a5c38' }}>{formatTokens(schedule.released)}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Releasable Now</p>
-                              <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{formatTokens(releasable)}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Status</p>
-                              <p className="text-sm font-bold" style={{
-                                color: schedule.revoked ? '#dc2626' :
-                                  releasable.add(schedule.released).gte(schedule.totalAmount) ? '#3b82f6' : '#22c55e'
-                              }}>
-                                {schedule.revoked ? 'Revoked' :
-                                  releasable.add(schedule.released).gte(schedule.totalAmount) ? 'Vesting Complete' : 'Active'}
-                              </p>
-                            </div>
-                          </div>
-                          <div className="grid grid-cols-3 gap-3 mb-3">
-                            <div>
-                              <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Start Date</p>
-                              <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{formatDate(schedule.start)}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>Cliff Date</p>
-                              <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{formatDate(schedule.cliff)}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs uppercase tracking-wide" style={{ color: '#64748b' }}>End Date</p>
-                              <p className="text-sm font-bold" style={{ color: '#0f4c5c' }}>{getEndDate(schedule)}</p>
-                            </div>
-                          </div>
-                          {!schedule.revoked && (
-                            <button
-                              onClick={() => handleRevoke(vestingId)}
-                              disabled={isLoading}
-                              className="px-5 py-2 rounded-xl font-semibold text-white text-sm transition-all hover:opacity-90 btn-hover"
-                              style={{
-                                backgroundColor: '#6b0f1a',
-                                opacity: isLoading ? 0.5 : 1,
-                                cursor:  isLoading ? 'not-allowed' : 'pointer',
-                              }}>
-                              Revoke
-                            </button>
-                          )}
+                          Update Root
+                        </button>
+                      </div>
+
+                      {/* UPDATE DEADLINE */}
+                      <hr style={{ borderColor: 'rgba(15,76,92,0.1)', margin: '0 0 24px 0' }} />
+                      <p className="text-sm font-semibold mb-2" style={{ color: '#7c3aed' }}>Update Claim Deadline</p>
+                      <p className="text-xs mb-3" style={{ color: '#64748b' }}>
+                        Current deadline: <strong>{formatDeadline(claimDeadline)}</strong>
+                      </p>
+                      <div className="flex gap-3 mb-8">
+                        <div className="border rounded-xl px-4 py-3 text-sm flex items-center justify-between flex-1"
+                          style={{ borderColor: '#bae6fd', backgroundColor: '#fff' }}>
+                          <span style={{ color: '#94a3b8', userSelect: 'none' }}>New Deadline</span>
+                          <input type="date"
+                            value={newDeadline} onChange={(e) => setNewDeadline(e.target.value)}
+                            className="outline-none text-sm"
+                            style={{ color: '#334155', border: 'none', background: 'transparent', cursor: 'pointer' }} />
                         </div>
-                      ))}
-                    </div>
+                        <button onClick={handleUpdateDeadline} disabled={isLoading}
+                          className="px-6 py-3 rounded-xl font-semibold text-white transition-all hover:opacity-90 btn-hover"
+                          style={{
+                            backgroundColor: '#7c3aed',
+                            opacity: isLoading ? 0.6 : 1,
+                            cursor:  isLoading ? 'not-allowed' : 'pointer',
+                          }}>
+                          Update Deadline
+                        </button>
+                      </div>
+
+                      {/* RECOVER TOKENS */}
+                      <hr style={{ borderColor: 'rgba(15,76,92,0.1)', margin: '0 0 24px 0' }} />
+                      <p className="text-sm font-semibold mb-2" style={{ color: '#6b0f1a' }}>Recover Unclaimed Tokens</p>
+                      <p className="text-xs mb-3" style={{ color: '#64748b' }}>
+                        Only available after the claim deadline has passed. Sends all remaining tokens back to admin.
+                      </p>
+                      <button onClick={handleRecover} disabled={isLoading || !deadlinePassed() || Number(contractBalance) === 0}
+                        className="px-6 py-3 rounded-xl font-semibold text-white transition-all hover:opacity-90 btn-hover mb-8"
+                        style={{
+                          backgroundColor: '#6b0f1a',
+                          opacity: (isLoading || !deadlinePassed() || Number(contractBalance) === 0) ? 0.5 : 1,
+                          cursor:  (isLoading || !deadlinePassed() || Number(contractBalance) === 0) ? 'not-allowed' : 'pointer',
+                        }}>
+                        Recover Tokens
+                      </button>
+                      <hr style={{ borderColor: 'rgba(15,76,92,0.1)', margin: '0 0 24px 0' }} />
+                    </>
                   )}
 
-                  {/* WITHDRAW */}
-                  <p className="text-sm font-semibold mb-3" style={{ color: '#84cc16' }}>Withdraw Unlocked Tokens</p>
-                  <div className="flex gap-3">
-                    <input type="number" placeholder="Amount to withdraw"
-                      value={withdrawAmount} onChange={(e) => setWithdrawAmount(e.target.value)}
-                      className="w-48 border rounded-xl px-4 py-3 text-sm outline-none"
-                      style={{ borderColor: '#bae6fd', color: '#334155' }} />
-                    <button onClick={handleWithdraw} disabled={isLoading}
-                      className="px-6 py-3 rounded-xl font-semibold text-white transition-all hover:opacity-90 btn-hover"
-                      style={{
-                        backgroundColor: '#84cc16',
-                        opacity: isLoading ? 0.6 : 1,
-                        cursor:  isLoading ? 'not-allowed' : 'pointer',
-                      }}>
-                      Withdraw
-                    </button>
-                    <button
-                      onClick={() => setWithdrawAmount(withdrawable)}
-                      disabled={isLoading}
-                      className="px-4 py-3 rounded-xl font-semibold text-white transition-all hover:opacity-90 btn-hover"
-                      style={{
-                        backgroundColor: '#3b82f6',
-                        opacity: isLoading ? 0.6 : 1,
-                        cursor: isLoading ? 'not-allowed' : 'pointer',
-                      }}>
-                      Max
-                    </button>
-                  </div>
+                  {/* PAUSE / UNPAUSE */}
+                  {isPauser && (
+                    <>
+                      <p className="text-sm font-semibold mb-3" style={{ color: '#0f4c5c' }}>
+                        Airdrop Status: <span style={{ color: isPaused ? '#dc2626' : '#22c55e' }}>
+                          {isPaused ? 'Paused' : 'Active'}
+                        </span>
+                      </p>
+                      <button onClick={handlePause} disabled={isLoading}
+                        className="px-6 py-3 rounded-xl font-semibold text-white transition-all hover:opacity-90 btn-hover"
+                        style={{
+                          backgroundColor: isPaused ? '#22c55e' : '#f59e0b',
+                          opacity: isLoading ? 0.6 : 1,
+                          cursor:  isLoading ? 'not-allowed' : 'pointer',
+                        }}>
+                        {isPaused ? 'Unpause Airdrop' : 'Pause Airdrop'}
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
 
               {/* EMPTY STATE */}
-              {!isAdmin && mySchedules.length === 0 && (
+              {!isAdmin && !isPauser && !eligible && (
                 <div className="p-4 rounded-xl text-base font-medium text-center"
                   style={{
                     backgroundColor: 'rgba(255,255,255,0.4)',
@@ -800,7 +642,7 @@ function App() {
                     borderLeft: '4px solid #0f4c5c',
                     color: '#64748b',
                   }}>
-                  <span style={{ fontSize: '1.6rem' }}>🔐</span> Connect with a wallet that has an active vesting schedule to view your tokens.
+                  <span style={{ fontSize: '1.6rem' }}>🔐</span> This wallet is not on the airdrop whitelist.
                 </div>
               )}
             </>
