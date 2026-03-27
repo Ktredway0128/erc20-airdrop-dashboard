@@ -108,7 +108,9 @@ function App() {
       
       if (chainId !== '0xaa36a7') {
         setStatus('Please switch MetaMask to the Sepolia network.');
-
+        setStatusStyle(STATUS_COLORS.error);
+        return;
+      }
       await window.ethereum.request({ method: 'eth_requestAccounts' });
 
       const metaMaskProvider = new ethers.providers.Web3Provider(window.ethereum);
