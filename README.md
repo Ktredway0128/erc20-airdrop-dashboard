@@ -1,4 +1,4 @@
-# ERC-20 TOKEN AIRDROP DASHBOARD
+# TOKEN AIRDROP DASHBOARD
 
 [![Verified on Etherscan](https://img.shields.io/badge/Etherscan-Verified-brightgreen)](https://sepolia.etherscan.io/address/0x1e79DE344A8B99CAF74E60dc1bD7cCE26e9f5524#code)
 
@@ -203,8 +203,8 @@ Contains the Alchemy RPC URL used for all read operations.
 ### CLONE THE REPOSITORY:
 
 ```bash
-git clone https://github.com/Ktredway0128/erc20-airdrop-dashboard
-cd erc20-airdrop-dashboard
+git clone https://github.com/Ktredway0128/token-airdrop-dashboard
+cd token-airdrop-dashboard
 ```
 
 ### INSTALL DEPENDENCIES:
